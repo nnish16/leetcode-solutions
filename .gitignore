@@ -1,3 +1,6 @@
 .automation.lock
 automation_runs/
 __pycache__/
+.automation.lock
+automation_runs/
+__pycache__/
