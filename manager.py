@@ -8,6 +8,8 @@ import fcntl
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 from dataclasses import asdict, dataclass
@@ -18,6 +20,8 @@ REPO_ROOT = Path(__file__).resolve().parent
 STATE_PATH = REPO_ROOT / "automation_state.json"
 LOCK_PATH = REPO_ROOT / ".automation.lock"
 RUNS_DIR = REPO_ROOT / "automation_runs"
+AUTOMATION_DIR = REPO_ROOT / "automation"
+EXECUTOR_PATH = AUTOMATION_DIR / "browser_executor.js"
 PROBLEM_FILE_PATTERN = re.compile(r"^(\d{4})_.+\.py$")
 DEFAULT_STATE = {
     "sequential": {
@@ -170,6 +174,53 @@ def build_slug(problem_id: int) -> str:
     return f"problem-{problem_id:04d}"
 
 
+def canonical_solution_path(problem_id: int, slug: str) -> Path:
+    slug_part = slug.replace("-", "_")
+    return REPO_ROOT / f"{problem_id:04d}_{slug_part}.py"
+
+
+def run_browser_executor(problem_id: int, slug: str | None, solution_file: Path, cdp_url: str) -> dict[str, Any]:
+    if not EXECUTOR_PATH.exists():
+        raise FileNotFoundError(f"Missing browser executor: {EXECUTOR_PATH}")
+    if not solution_file.exists():
+        raise FileNotFoundError(f"Missing solution file: {solution_file}")
+
+    command = [
+        "node",
+        str(EXECUTOR_PATH),
+        "--problem-id",
+        str(problem_id),
+        "--solution-file",
+        str(solution_file),
+        "--cdp-url",
+        cdp_url,
+    ]
+    if slug:
+        command.extend(["--slug", slug])
+
+    completed = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    output = (completed.stdout or "").strip()
+    if not output:
+        stderr = (completed.stderr or "").strip()
+        raise RuntimeError(f"Browser executor produced no JSON output. stderr={stderr!r}")
+
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Browser executor emitted invalid JSON: {output[:500]!r}") from exc
+
+    payload["exit_code"] = completed.returncode
+    if completed.stderr:
+        payload["stderr"] = completed.stderr.strip()
+    return payload
+
+
 def plan_targets(
     solved_ids: set[int],
     sequential_prefix: int,
@@ -295,6 +346,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also print the computed run payload as JSON.",
     )
+    parser.add_argument("--execute-target-id", type=int, help="Execute a single target in the browser before writing repo/state updates.")
+    parser.add_argument("--execute-target-slug", help="Exact LeetCode slug for --execute-target-id. If omitted, the browser executor resolves it.")
+    parser.add_argument("--solution-file", help="Local Python solution file to submit for --execute-target-id.")
+    parser.add_argument(
+        "--cdp-url",
+        default=os.environ.get("LEETCODE_CDP_URL", "http://127.0.0.1:56278"),
+        help="HTTP CDP base URL for the existing Playwright-managed Chrome session.",
+    )
     return parser.parse_args()
 
 
@@ -321,8 +380,41 @@ def main() -> int:
             state["daily_challenge"]["last_checked_date"] = dt.date.today().isoformat()
             if args.daily_id is not None:
                 state["daily_challenge"]["last_attempted_id"] = args.daily_id
-            if args.mark_solved:
-                latest_solved = args.mark_solved[-1]
+
+            browser_execution: dict[str, Any] | None = None
+            persisted_solution_path: Path | None = None
+            marked_solved = list(args.mark_solved)
+            if args.execute_target_id is not None:
+                if not args.solution_file:
+                    raise ValueError("--solution-file is required with --execute-target-id")
+                browser_execution = run_browser_executor(
+                    problem_id=args.execute_target_id,
+                    slug=args.execute_target_slug,
+                    solution_file=Path(args.solution_file).resolve(),
+                    cdp_url=args.cdp_url,
+                )
+                if not browser_execution.get("accepted"):
+                    raise RuntimeError(
+                        f"Browser executor did not confirm Accepted state for #{args.execute_target_id}: "
+                        f"{browser_execution.get('error', {}).get('message', 'unknown failure')}"
+                    )
+
+                resolved_slug = browser_execution["problem"]["slug"]
+                persisted_solution_path = canonical_solution_path(args.execute_target_id, resolved_slug)
+                source_solution_path = Path(args.solution_file).resolve()
+                if source_solution_path != persisted_solution_path.resolve():
+                    shutil.copyfile(source_solution_path, persisted_solution_path)
+                solved_ids = scan_solved_problem_ids(REPO_ROOT)
+                solved_set = set(solved_ids)
+                prefix = contiguous_prefix(solved_ids)
+                state["sequential"]["last_contiguous_solved_id"] = prefix
+                state["sequential"]["next_target_id"] = prefix + 1
+                state["sequential"]["updated_from_repo_scan"] = True
+                if args.execute_target_id not in marked_solved:
+                    marked_solved.append(args.execute_target_id)
+
+            if marked_solved:
+                latest_solved = marked_solved[-1]
                 if latest_solved == args.daily_id:
                     state["daily_challenge"]["last_completed_id"] = latest_solved
                     state["daily_challenge"]["last_completed_slug"] = args.daily_slug or build_slug(latest_solved)
@@ -335,6 +427,10 @@ def main() -> int:
                     "daily_id": args.daily_id,
                     "daily_slug": args.daily_slug,
                     "mark_solved": args.mark_solved,
+                    "execute_target_id": args.execute_target_id,
+                    "execute_target_slug": args.execute_target_slug,
+                    "solution_file": args.solution_file,
+                    "cdp_url": args.cdp_url,
                 },
                 "repo_scan": {
                     "solved_ids": solved_ids,
@@ -350,15 +446,19 @@ def main() -> int:
                 },
                 "state_after": state,
                 "execution": {
-                    "mode": "planner_only",
-                    "submission_integration": "stubbed",
-                    "marked_solved": args.mark_solved,
+                    "mode": "planner_plus_browser_executor" if browser_execution else "planner_only",
+                    "submission_integration": "browser_executor" if browser_execution else "stubbed",
+                    "marked_solved": marked_solved,
+                    "browser_execution": browser_execution,
+                    "persisted_solution_path": str(persisted_solution_path) if persisted_solution_path else None,
                 },
             }
 
             print_plan(plan, solved_ids)
-            if args.mark_solved:
-                print(f"Marked solved (metadata only): {', '.join(map(str, args.mark_solved))}")
+            if marked_solved:
+                print(f"Marked solved: {', '.join(map(str, marked_solved))}")
+            if persisted_solution_path:
+                print(f"Persisted accepted solution: {persisted_solution_path}")
             if args.dry_run:
                 print("Dry run: state and run log were not written.")
             else:
@@ -377,6 +477,9 @@ def main() -> int:
         return errno.ENOENT
     except json.JSONDecodeError as exc:
         print(f"Invalid JSON in state file: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"Automation error: {exc}", file=sys.stderr)
         return 1
 
     return 0

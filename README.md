@@ -26,3 +26,29 @@ Behavior:
 - supports `--dry-run` to avoid state/log writes
 
 Submission/browser automation is intentionally left stubbed so the core planner remains deterministic and safe.
+
+
+## Deterministic browser executor
+
+The repo now includes `automation/browser_executor.js`, a deterministic CDP-based executor for the proven LeetCode browser flow.
+
+It is designed to:
+
+- reuse the existing dedicated Chrome session exposed over CDP
+- verify in-browser signed-in state
+- navigate to the exact target problem page
+- assert the problem page, Python3 selection, and Monaco editor presence
+- paste code by updating the Monaco model and verify the model changed
+- tolerate missing `Run` while still allowing submission
+- wait for an `Accepted` submissions-page state before repo/state persistence happens
+
+Example manager-driven execution for the confirmed `#41` flow:
+
+```bash
+python3 manager.py \
+  --execute-target-id 41 \
+  --solution-file /tmp/0041_first_missing_positive.py \
+  --cdp-url http://127.0.0.1:56278
+```
+
+Only after the browser executor reports an Accepted submission will `manager.py` copy the solution into the repo, recompute progress, update `automation_state.json`, and write the run log.
