@@ -4,3 +4,4 @@ __pycache__/
 .automation.lock
 automation_runs/
 __pycache__/
+automation_state.json
