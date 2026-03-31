@@ -1,53 +1,386 @@
-import requests
-import os
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import errno
+import fcntl
 import json
+import os
+import re
+import sys
+import tempfile
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
 
-# Configuration
-REPO_PATH = "."  # Current folder
-START_ID = 2     # Skip "Two Sum" if you want, or start at 1
-DAILY_LIMIT = 5
+REPO_ROOT = Path(__file__).resolve().parent
+STATE_PATH = REPO_ROOT / "automation_state.json"
+LOCK_PATH = REPO_ROOT / ".automation.lock"
+RUNS_DIR = REPO_ROOT / "automation_runs"
+PROBLEM_FILE_PATTERN = re.compile(r"^(\d{4})_.+\.py$")
+DEFAULT_STATE = {
+    "sequential": {
+        "last_contiguous_solved_id": 0,
+        "next_target_id": 1,
+        "updated_from_repo_scan": True,
+    },
+    "daily_challenge": {
+        "last_checked_date": None,
+        "last_attempted_id": None,
+        "last_completed_id": None,
+        "last_completed_slug": None,
+        "notes": "If the daily challenge is already solved in repo history, skip it without affecting the sequential counter. If the daily challenge is unsolved and outside the current sequential target, solve it in addition to the sequential target(s), but do not advance the sequential counter past unsolved gaps.",
+    },
+    "rules": {
+        "mode": "sequential_plus_daily",
+        "sequential_batch_size": 1,
+        "daily_batch_size": 1,
+        "skip_daily_if_already_solved": True,
+        "do_not_advance_sequential_counter_for_out_of_order_solves": True,
+        "advance_sequential_counter_only_when_contiguous_prefix_extends": True,
+    },
+}
 
-def get_next_problems():
-    # 1. Get official problem list (slugs)
-    url = "https://leetcode.com/api/problems/all/"
-    data = requests.get(url).json()
-    
-    # 2. Filter for free algorithms
-    problems = []
-    for p in data['stat_status_pairs']:
-        if not p['paid_only']:
-            problems.append({
-                'id': p['stat']['question_id'],
-                'title': p['stat']['question__title'],
-                'slug': p['stat']['question__title_slug'],
-                'difficulty': p['difficulty']['level'] # 1=Easy, 2=Med, 3=Hard
-            })
-            
-    # 3. Sort by ID (1, 2, 3...)
-    problems.sort(key=lambda x: x['id'])
-    
-    # 4. Find what we already solved (check filenames)
-    existing_files = os.listdir(REPO_PATH)
-    solved_ids = []
-    for f in existing_files:
-        if "_" in f:
+
+@dataclass(frozen=True)
+class ProblemTarget:
+    id: int
+    slug: str | None
+    track: str
+    already_solved: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class ExecutionPlan:
+    sequential_prefix: int
+    sequential_targets: list[ProblemTarget]
+    daily_target: ProblemTarget | None
+    total_targets: int
+    daily_status: str
+    notes: list[str]
+
+
+class AutomationLock:
+    def __init__(self, path: Path):
+        self.path = path
+        self.handle = None
+
+    def __enter__(self) -> "AutomationLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            self.handle.seek(0)
+            owner = self.handle.read().strip()
+            raise RuntimeError(
+                f"Another automation run is already active ({owner or 'lock held'})."
+            ) from exc
+
+        self.handle.seek(0)
+        self.handle.truncate()
+        payload = {
+            "pid": os.getpid(),
+            "started_at": now_iso(),
+            "cwd": str(REPO_ROOT),
+        }
+        self.handle.write(json.dumps(payload, indent=2))
+        self.handle.flush()
+        os.fsync(self.handle.fileno())
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.handle is None:
+            return
+        try:
+            self.handle.seek(0)
+            self.handle.truncate()
+            self.handle.flush()
+            os.fsync(self.handle.fileno())
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.handle.close()
             try:
-                solved_ids.append(int(f.split("_")[0]))
-            except:
+                self.path.unlink()
+            except FileNotFoundError:
                 pass
-                
-    # 5. Pick next batch
-    todo = []
-    for p in problems:
-        if p['id'] >= START_ID and p['id'] not in solved_ids:
-            todo.append(p)
-            if len(todo) >= DAILY_LIMIT:
-                break
-                
-    return todo
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def load_state(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return json.loads(json.dumps(DEFAULT_STATE))
+
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    state = json.loads(json.dumps(DEFAULT_STATE))
+    for key, value in data.items():
+        if isinstance(value, dict) and isinstance(state.get(key), dict):
+            state[key].update(value)
+        else:
+            state[key] = value
+    return state
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+
+def scan_solved_problem_ids(repo_root: Path) -> list[int]:
+    solved_ids = []
+    for path in repo_root.iterdir():
+        if not path.is_file():
+            continue
+        match = PROBLEM_FILE_PATTERN.match(path.name)
+        if match:
+            solved_ids.append(int(match.group(1)))
+    return sorted(set(solved_ids))
+
+
+def contiguous_prefix(solved_ids: list[int]) -> int:
+    expected = 1
+    for problem_id in solved_ids:
+        if problem_id != expected:
+            break
+        expected += 1
+    return expected - 1
+
+
+def build_slug(problem_id: int) -> str:
+    return f"problem-{problem_id:04d}"
+
+
+def plan_targets(
+    solved_ids: set[int],
+    sequential_prefix: int,
+    daily_id: int | None,
+    daily_slug: str | None,
+) -> ExecutionPlan:
+    next_sequential = sequential_prefix + 1
+    notes: list[str] = []
+    sequential_targets: list[ProblemTarget] = []
+    daily_target: ProblemTarget | None = None
+
+    daily_status = "not_provided"
+    if daily_id is not None:
+        daily_slug = daily_slug or build_slug(daily_id)
+        if daily_id in solved_ids:
+            daily_status = "already_solved"
+            notes.append(
+                f"Daily challenge {daily_id} is already solved, so the run backfills with a second sequential target."
+            )
+        elif daily_id == next_sequential:
+            daily_status = "matches_next_sequential"
+            daily_target = ProblemTarget(
+                id=daily_id,
+                slug=daily_slug,
+                track="daily+sequential",
+                already_solved=False,
+                reason="Daily challenge matches the next unsolved sequential problem, so one solve satisfies both tracks.",
+            )
+            sequential_targets.append(daily_target)
+        else:
+            daily_status = "planned"
+            daily_target = ProblemTarget(
+                id=daily_id,
+                slug=daily_slug,
+                track="daily",
+                already_solved=False,
+                reason="Independent daily challenge target.",
+            )
+            notes.append(
+                "Daily challenge is outside the sequential prefix, so solving it will not advance the sequential counter by itself."
+            )
+
+    desired_sequential_count = 1
+    if daily_status == "already_solved":
+        desired_sequential_count = 2
+
+    candidate = next_sequential
+    while len(sequential_targets) < desired_sequential_count:
+        if candidate in solved_ids:
+            candidate += 1
+            continue
+        if any(target.id == candidate for target in sequential_targets):
+            candidate += 1
+            continue
+        sequential_targets.append(
+            ProblemTarget(
+                id=candidate,
+                slug=build_slug(candidate),
+                track="sequential",
+                already_solved=False,
+                reason="Next unsolved problem in the contiguous sequential track.",
+            )
+        )
+        candidate += 1
+
+    if daily_status == "not_provided":
+        notes.append("No daily challenge was provided, so the plan contains only sequential work.")
+
+    return ExecutionPlan(
+        sequential_prefix=sequential_prefix,
+        sequential_targets=sequential_targets,
+        daily_target=daily_target,
+        total_targets=len(sequential_targets) + (1 if daily_target and daily_target.track == "daily" else 0),
+        daily_status=daily_status,
+        notes=notes,
+    )
+
+
+def write_run_log(run_record: dict[str, Any]) -> Path:
+    started_at = dt.datetime.fromisoformat(run_record["started_at"])
+    day_dir = RUNS_DIR / started_at.strftime("%Y-%m-%d")
+    day_dir.mkdir(parents=True, exist_ok=True)
+    log_path = day_dir / f"{started_at.strftime('%H%M%S')}-{os.getpid()}.json"
+    atomic_write_json(log_path, run_record)
+    return log_path
+
+
+def print_plan(plan: ExecutionPlan, solved_ids: list[int]) -> None:
+    print(f"Solved contiguous prefix: 1..{plan.sequential_prefix}")
+    print(f"Total solved files found: {len(solved_ids)}")
+    print(f"Daily status: {plan.daily_status}")
+    print("Execution plan:")
+    for target in plan.sequential_targets:
+        print(f"  - [{target.track}] #{target.id} ({target.slug})")
+    if plan.daily_target and plan.daily_target.track == "daily":
+        print(f"  - [daily] #{plan.daily_target.id} ({plan.daily_target.slug})")
+    if not plan.sequential_targets and not plan.daily_target:
+        print("  - nothing to do")
+    if plan.notes:
+        print("Notes:")
+        for note in plan.notes:
+            print(f"  - {note}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Local LeetCode automation planner/runner")
+    parser.add_argument("--daily-id", type=int, help="Daily challenge problem ID")
+    parser.add_argument("--daily-slug", help="Daily challenge slug")
+    parser.add_argument(
+        "--mark-solved",
+        type=int,
+        action="append",
+        default=[],
+        help="Record a problem ID as solved in the run log/state metadata. Repeatable.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the plan without persisting state or run logs.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Also print the computed run payload as JSON.",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    started_at = now_iso()
+
+    try:
+        with AutomationLock(LOCK_PATH):
+            state = load_state(STATE_PATH)
+            solved_ids = scan_solved_problem_ids(REPO_ROOT)
+            solved_set = set(solved_ids)
+            prefix = contiguous_prefix(solved_ids)
+            plan = plan_targets(
+                solved_ids=solved_set,
+                sequential_prefix=prefix,
+                daily_id=args.daily_id,
+                daily_slug=args.daily_slug,
+            )
+
+            state["sequential"]["last_contiguous_solved_id"] = prefix
+            state["sequential"]["next_target_id"] = prefix + 1
+            state["sequential"]["updated_from_repo_scan"] = True
+            state["daily_challenge"]["last_checked_date"] = dt.date.today().isoformat()
+            if args.daily_id is not None:
+                state["daily_challenge"]["last_attempted_id"] = args.daily_id
+            if args.mark_solved:
+                latest_solved = args.mark_solved[-1]
+                if latest_solved == args.daily_id:
+                    state["daily_challenge"]["last_completed_id"] = latest_solved
+                    state["daily_challenge"]["last_completed_slug"] = args.daily_slug or build_slug(latest_solved)
+
+            run_record = {
+                "started_at": started_at,
+                "finished_at": now_iso(),
+                "dry_run": args.dry_run,
+                "inputs": {
+                    "daily_id": args.daily_id,
+                    "daily_slug": args.daily_slug,
+                    "mark_solved": args.mark_solved,
+                },
+                "repo_scan": {
+                    "solved_ids": solved_ids,
+                    "contiguous_prefix": prefix,
+                },
+                "plan": {
+                    "sequential_prefix": plan.sequential_prefix,
+                    "daily_status": plan.daily_status,
+                    "notes": plan.notes,
+                    "sequential_targets": [asdict(target) for target in plan.sequential_targets],
+                    "daily_target": asdict(plan.daily_target) if plan.daily_target else None,
+                    "total_targets": plan.total_targets,
+                },
+                "state_after": state,
+                "execution": {
+                    "mode": "planner_only",
+                    "submission_integration": "stubbed",
+                    "marked_solved": args.mark_solved,
+                },
+            }
+
+            print_plan(plan, solved_ids)
+            if args.mark_solved:
+                print(f"Marked solved (metadata only): {', '.join(map(str, args.mark_solved))}")
+            if args.dry_run:
+                print("Dry run: state and run log were not written.")
+            else:
+                atomic_write_json(STATE_PATH, state)
+                log_path = write_run_log(run_record)
+                print(f"Updated state: {STATE_PATH}")
+                print(f"Run log: {log_path}")
+
+            if args.json:
+                print(json.dumps(run_record, indent=2))
+    except RuntimeError as exc:
+        print(f"Lock error: {exc}", file=sys.stderr)
+        return 2
+    except FileNotFoundError as exc:
+        print(f"Missing file: {exc}", file=sys.stderr)
+        return errno.ENOENT
+    except json.JSONDecodeError as exc:
+        print(f"Invalid JSON in state file: {exc}", file=sys.stderr)
+        return 1
+
+    return 0
+
 
 if __name__ == "__main__":
-    batch = get_next_problems()
-    print("Here are your targets for today:")
-    for p in batch:
-        print(f"ID: {p['id']} | URL: https://leetcode.com/problems/{p['slug']}/")
+    raise SystemExit(main())
