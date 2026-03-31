@@ -51,4 +51,30 @@ python3 manager.py \
   --cdp-url http://127.0.0.1:56278
 ```
 
+When `--execute-target-id` is present, the explicit target is the only thing executed. The printed sequential/daily plan remains informational context from the repo scan; it is not the thing being submitted.
+
 Only after the browser executor reports an Accepted submission will `manager.py` copy the solution into the repo, recompute progress, update `automation_state.json`, and write the run log.
+
+### Cron-facing deterministic executor path
+
+Cron should call the explicit executor path directly, not rely on the planner to choose a target implicitly.
+
+Recommended shape:
+
+```bash
+cd /Users/nish/Documents/leetcode-solutions && \
+python3 manager.py \
+  --execute-target-id "$PROBLEM_ID" \
+  --execute-target-slug "$PROBLEM_SLUG" \
+  --solution-file "$SOLUTION_FILE" \
+  --daily-id "$PROBLEM_ID" \
+  --daily-slug "$PROBLEM_SLUG" \
+  --cdp-url http://127.0.0.1:56278
+```
+
+Notes:
+
+- pass `--execute-target-id` and `--solution-file` every time for actual submission runs
+- pass `--execute-target-slug` when you already know the exact slug; otherwise the executor resolves it
+- if the cron job is solving that day's daily challenge, also pass the same values via `--daily-id/--daily-slug` so `automation_state.json` records daily completion metadata correctly
+- if the explicit target was already present in the repo, acceptance is still allowed, but the recomputed sequential prefix may stay unchanged

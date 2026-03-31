@@ -66,6 +66,14 @@ class ExecutionPlan:
     notes: list[str]
 
 
+@dataclass(frozen=True)
+class ExplicitExecutionTarget:
+    id: int
+    slug: str | None
+    already_solved_in_repo: bool
+    source_solution_file: Path
+
+
 class AutomationLock:
     def __init__(self, path: Path):
         self.path = path
@@ -308,10 +316,25 @@ def write_run_log(run_record: dict[str, Any]) -> Path:
     return log_path
 
 
-def print_plan(plan: ExecutionPlan, solved_ids: list[int]) -> None:
+def print_plan(
+    plan: ExecutionPlan,
+    solved_ids: list[int],
+    explicit_target: ExplicitExecutionTarget | None = None,
+) -> None:
     print(f"Solved contiguous prefix: 1..{plan.sequential_prefix}")
     print(f"Total solved files found: {len(solved_ids)}")
     print(f"Daily status: {plan.daily_status}")
+    if explicit_target:
+        print("Explicit execution target:")
+        print(f"  - #{explicit_target.id} ({explicit_target.slug or 'slug resolved by executor'})")
+        print(f"  - source file: {explicit_target.source_solution_file}")
+        print(
+            "  - repo status: already solved"
+            if explicit_target.already_solved_in_repo
+            else "  - repo status: not yet solved"
+        )
+        print("Planner context:")
+        print("  - sequential/daily plan below is informational only; execution is pinned to the explicit target above.")
     print("Execution plan:")
     for target in plan.sequential_targets:
         print(f"  - [{target.track}] #{target.id} ({target.slug})")
@@ -323,6 +346,8 @@ def print_plan(plan: ExecutionPlan, solved_ids: list[int]) -> None:
         print("Notes:")
         for note in plan.notes:
             print(f"  - {note}")
+    if explicit_target and explicit_target.already_solved_in_repo:
+        print("  - Explicit target was already present in the repo, so recomputed sequential progress may remain unchanged after acceptance.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -383,14 +408,22 @@ def main() -> int:
 
             browser_execution: dict[str, Any] | None = None
             persisted_solution_path: Path | None = None
+            explicit_target: ExplicitExecutionTarget | None = None
             marked_solved = list(args.mark_solved)
             if args.execute_target_id is not None:
                 if not args.solution_file:
                     raise ValueError("--solution-file is required with --execute-target-id")
+                source_solution_path = Path(args.solution_file).resolve()
+                explicit_target = ExplicitExecutionTarget(
+                    id=args.execute_target_id,
+                    slug=args.execute_target_slug,
+                    already_solved_in_repo=args.execute_target_id in solved_set,
+                    source_solution_file=source_solution_path,
+                )
                 browser_execution = run_browser_executor(
                     problem_id=args.execute_target_id,
                     slug=args.execute_target_slug,
-                    solution_file=Path(args.solution_file).resolve(),
+                    solution_file=source_solution_path,
                     cdp_url=args.cdp_url,
                 )
                 if not browser_execution.get("accepted"):
@@ -400,8 +433,13 @@ def main() -> int:
                     )
 
                 resolved_slug = browser_execution["problem"]["slug"]
+                explicit_target = ExplicitExecutionTarget(
+                    id=explicit_target.id,
+                    slug=resolved_slug,
+                    already_solved_in_repo=explicit_target.already_solved_in_repo,
+                    source_solution_file=explicit_target.source_solution_file,
+                )
                 persisted_solution_path = canonical_solution_path(args.execute_target_id, resolved_slug)
-                source_solution_path = Path(args.solution_file).resolve()
                 if source_solution_path != persisted_solution_path.resolve():
                     shutil.copyfile(source_solution_path, persisted_solution_path)
                 solved_ids = scan_solved_problem_ids(REPO_ROOT)
@@ -416,8 +454,11 @@ def main() -> int:
             if marked_solved:
                 latest_solved = marked_solved[-1]
                 if latest_solved == args.daily_id:
+                    completed_slug = args.daily_slug or build_slug(latest_solved)
+                    if browser_execution and browser_execution.get("problem", {}).get("id") == latest_solved:
+                        completed_slug = browser_execution["problem"].get("slug") or completed_slug
                     state["daily_challenge"]["last_completed_id"] = latest_solved
-                    state["daily_challenge"]["last_completed_slug"] = args.daily_slug or build_slug(latest_solved)
+                    state["daily_challenge"]["last_completed_slug"] = completed_slug
 
             run_record = {
                 "started_at": started_at,
@@ -443,6 +484,12 @@ def main() -> int:
                     "sequential_targets": [asdict(target) for target in plan.sequential_targets],
                     "daily_target": asdict(plan.daily_target) if plan.daily_target else None,
                     "total_targets": plan.total_targets,
+                    "explicit_execution_target": {
+                        "id": explicit_target.id,
+                        "slug": explicit_target.slug,
+                        "already_solved_in_repo": explicit_target.already_solved_in_repo,
+                        "source_solution_file": str(explicit_target.source_solution_file),
+                    } if explicit_target else None,
                 },
                 "state_after": state,
                 "execution": {
@@ -454,7 +501,7 @@ def main() -> int:
                 },
             }
 
-            print_plan(plan, solved_ids)
+            print_plan(plan, solved_ids, explicit_target=explicit_target)
             if marked_solved:
                 print(f"Marked solved: {', '.join(map(str, marked_solved))}")
             if persisted_solution_path:
