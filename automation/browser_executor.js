@@ -234,18 +234,62 @@ async function main() {
     const languageResult = await checkpoint(
       'language_selection',
       `(() => {
+        const textOf = (el) => (el && (el.innerText || el.textContent || '')).trim();
         const buttons = [...document.querySelectorAll('button')];
-        const direct = buttons.find((b) => /^Python3$/i.test(b.innerText.trim()));
-        if (direct) return { selected: true, strategy: 'already_or_direct_button', label: direct.innerText.trim() };
+        const pythonDirect = buttons.find((b) => /^Python3$/i.test(textOf(b)));
+        if (pythonDirect) {
+          pythonDirect.click();
+          return { selected: true, strategy: 'direct_button', label: textOf(pythonDirect) };
+        }
+
+        const currentControl = buttons.find((b) => ['C++', 'Java', 'Python', 'Python3', 'JavaScript', 'TypeScript', 'Go', 'Rust', 'Kotlin', 'Swift', 'Ruby', 'Scala', 'C#'].includes(textOf(b)));
+        if (currentControl) {
+          currentControl.click();
+          const menuItems = [...document.querySelectorAll('[role="option"], [role="menuitem"], button, div, span')];
+          const pythonItem = menuItems.find((el) => /^Python3$/i.test(textOf(el)));
+          if (pythonItem) {
+            pythonItem.click();
+            return {
+              selected: true,
+              strategy: 'opened_picker_and_selected_python3',
+              previous: textOf(currentControl),
+              label: textOf(pythonItem),
+            };
+          }
+          return {
+            selected: false,
+            strategy: 'opened_picker_but_python3_missing',
+            previous: textOf(currentControl),
+            available: menuItems.map((el) => textOf(el)).filter(Boolean).slice(0, 120),
+          };
+        }
+
         return {
           selected: false,
-          strategy: 'no_direct_switch_attempted',
-          available: buttons.map((b) => b.innerText.trim()).filter(Boolean).slice(0, 60),
+          strategy: 'language_control_not_found',
+          available: buttons.map((b) => textOf(b)).filter(Boolean).slice(0, 80),
         };
       })()`,
     );
 
-    if (!languageResult?.selected) throw new Error('Python3 was not confirmed on the page');
+    await sleep(1200);
+
+    const languageConfirmation = await checkpoint(
+      'language_confirmation',
+      `(() => {
+        const textOf = (el) => (el && (el.innerText || el.textContent || '')).trim();
+        const buttons = [...document.querySelectorAll('button')];
+        const labels = buttons.map((b) => textOf(b)).filter(Boolean);
+        const models = (globalThis.monaco && monaco.editor) ? monaco.editor.getModels().map((m) => ({ lang: m.getLanguageId(), len: m.getValueLength() })) : [];
+        const pythonVisible = labels.some((label) => /^Python3$/i.test(label));
+        const pythonModel = models.some((m) => /python/i.test(m.lang || ''));
+        return { pythonVisible, pythonModel, labels: labels.slice(0, 80), models };
+      })()`,
+    );
+
+    if (!languageConfirmation?.pythonVisible && !languageConfirmation?.pythonModel) {
+      throw new Error('Python3 was not confirmed on the page');
+    }
 
     const beforePaste = await checkpoint(
       'editor_presence_before_paste',
@@ -276,17 +320,20 @@ async function main() {
         if (!(globalThis.monaco && monaco.editor)) return { applied: false, reason: 'monaco_missing' };
         const model = monaco.editor.getModels().find((m) => /python/i.test(m.getLanguageId())) || monaco.editor.getModels()[0];
         const value = model ? model.getValue() : '';
+        const expected = ${JSON.stringify(code)};
         return {
           applied: !!model,
           lang: model ? model.getLanguageId() : null,
           len: value.length,
           first_line: value.split('\\n')[0] || null,
-          has_solution_symbol: value.includes('class Solution') && value.includes('def firstMissingPositive'),
+          matches_expected: value === expected,
+          contains_class_solution: value.includes('class Solution'),
+          contains_def: /def\\s+[A-Za-z_][A-Za-z0-9_]*\\s*\\(/.test(value),
         };
       })()`,
     );
 
-    if (!afterPaste?.applied || !afterPaste?.has_solution_symbol) {
+    if (!afterPaste?.applied || !afterPaste?.matches_expected) {
       throw new Error('Editor model did not update with the intended Python solution');
     }
 
