@@ -235,42 +235,66 @@ async function main() {
       'language_selection',
       `(() => {
         const textOf = (el) => (el && (el.innerText || el.textContent || '')).trim();
-        const buttons = [...document.querySelectorAll('button')];
-        const pythonDirect = buttons.find((b) => /^Python3$/i.test(textOf(b)));
-        if (pythonDirect) {
-          pythonDirect.click();
-          return { selected: true, strategy: 'direct_button', label: textOf(pythonDirect) };
+        const models = () => (globalThis.monaco && monaco.editor)
+          ? monaco.editor.getModels().map((m) => ({ lang: m.getLanguageId(), len: m.getValueLength() }))
+          : [];
+        const allCandidates = [...document.querySelectorAll('button, [role="button"], [role="tab"], [role="option"], [role="menuitem"], div, span')];
+        const currentLabels = allCandidates.map(textOf).filter(Boolean);
+        const alreadyPython = models().some((m) => /python/i.test(m.lang || ''));
+        if (alreadyPython) {
+          return { selected: true, strategy: 'existing_python_model', models: models() };
         }
 
-        const currentControl = buttons.find((b) => ['C++', 'Java', 'Python', 'Python3', 'JavaScript', 'TypeScript', 'Go', 'Rust', 'Kotlin', 'Swift', 'Ruby', 'Scala', 'C#'].includes(textOf(b)));
+        const pythonDirect = allCandidates.find((el) => /^Python3?$/i.test(textOf(el)));
+        if (pythonDirect) {
+          pythonDirect.click();
+          return { selected: true, strategy: 'direct_candidate', label: textOf(pythonDirect) };
+        }
+
+        const currentControl = allCandidates.find((el) => ['C++', 'Java', 'Python', 'Python3', 'JavaScript', 'TypeScript', 'Go', 'Rust', 'Kotlin', 'Swift', 'Ruby', 'Scala', 'C#'].includes(textOf(el)));
         if (currentControl) {
           currentControl.click();
-          const menuItems = [...document.querySelectorAll('[role="option"], [role="menuitem"], button, div, span')];
-          const pythonItem = menuItems.find((el) => /^Python3$/i.test(textOf(el)));
-          if (pythonItem) {
-            pythonItem.click();
-            return {
-              selected: true,
-              strategy: 'opened_picker_and_selected_python3',
-              previous: textOf(currentControl),
-              label: textOf(pythonItem),
-            };
-          }
           return {
             selected: false,
-            strategy: 'opened_picker_but_python3_missing',
+            strategy: 'opened_picker_waiting_for_python',
             previous: textOf(currentControl),
-            available: menuItems.map((el) => textOf(el)).filter(Boolean).slice(0, 120),
+            available: currentLabels.slice(0, 120),
           };
         }
 
         return {
           selected: false,
           strategy: 'language_control_not_found',
-          available: buttons.map((b) => textOf(b)).filter(Boolean).slice(0, 80),
+          available: currentLabels.slice(0, 120),
+          models: models(),
         };
       })()`,
     );
+
+    if (!languageResult?.selected) {
+      for (let i = 0; i < 20; i += 1) {
+        const retry = await page.eval(`(() => {
+          const textOf = (el) => (el && (el.innerText || el.textContent || '')).trim();
+          const candidates = [...document.querySelectorAll('button, [role="button"], [role="tab"], [role="option"], [role="menuitem"], div, span')];
+          const pythonItem = candidates.find((el) => /^Python3?$/i.test(textOf(el)));
+          if (pythonItem) {
+            pythonItem.click();
+            return { selected: true, label: textOf(pythonItem) };
+          }
+          const models = (globalThis.monaco && monaco.editor) ? monaco.editor.getModels().map((m) => ({ lang: m.getLanguageId(), len: m.getValueLength() })) : [];
+          const alreadyPython = models.some((m) => /python/i.test(m.lang || ''));
+          return { selected: alreadyPython, waiting: !alreadyPython, models, labels: candidates.map(textOf).filter(Boolean).slice(0, 120) };
+        })()`);
+        if (retry?.selected) {
+          run.checkpoints.push({ name: 'language_selection_retry', at: new Date().toISOString(), value: retry });
+          break;
+        }
+        await sleep(300);
+        if (i === 19) {
+          run.checkpoints.push({ name: 'language_selection_retry', at: new Date().toISOString(), value: retry });
+        }
+      }
+    }
 
     await sleep(1200);
 
@@ -281,14 +305,14 @@ async function main() {
         const buttons = [...document.querySelectorAll('button')];
         const labels = buttons.map((b) => textOf(b)).filter(Boolean);
         const models = (globalThis.monaco && monaco.editor) ? monaco.editor.getModels().map((m) => ({ lang: m.getLanguageId(), len: m.getValueLength() })) : [];
-        const pythonVisible = labels.some((label) => /^Python3$/i.test(label));
+        const pythonVisible = labels.some((label) => /^Python3?$/i.test(label));
         const pythonModel = models.some((m) => /python/i.test(m.lang || ''));
         return { pythonVisible, pythonModel, labels: labels.slice(0, 80), models };
       })()`,
     );
 
     if (!languageConfirmation?.pythonVisible && !languageConfirmation?.pythonModel) {
-      throw new Error('Python3 was not confirmed on the page');
+      throw new Error('Python was not confirmed on the page');
     }
 
     const beforePaste = await checkpoint(
